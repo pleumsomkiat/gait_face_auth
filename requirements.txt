@@ -1,0 +1,8 @@
+opencv-python>=4.8.0
+numpy
+torch
+torchvision
+ultralytics
+deepface
+gdown
+
