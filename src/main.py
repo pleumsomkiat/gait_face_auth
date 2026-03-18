@@ -4,6 +4,7 @@ import os
 import pickle
 import numpy as np
 from datetime import datetime
+from collections import Counter
 
 from utils.google_drive import PublicDriveManager
 from utils.attendance_logger import AttendanceLogger
@@ -19,14 +20,42 @@ DB_PATH = os.path.join(PROJECT_ROOT, "database", "embeddings.pkl")
 
 
 def cosine_similarity(v1, v2):
+    if v1 is None or v2 is None:
+        return 0.0
+
+    v1 = np.asarray(v1, dtype=np.float32)
+    v2 = np.asarray(v2, dtype=np.float32)
+
+    if v1.shape != v2.shape:
+        return 0.0
+
     norm1 = np.linalg.norm(v1)
     norm2 = np.linalg.norm(v2)
     if norm1 == 0 or norm2 == 0:
         return 0.0
+
     return float(np.dot(v1, v2) / (norm1 * norm2))
 
 
+def stable_identity(history, default="Scanning..."):
+    """
+    history: list[str]
+    คืนชื่อที่ออกบ่อยสุดใน history
+    """
+    if not history:
+        return default
+
+    counter = Counter(history)
+    return counter.most_common(1)[0][0]
+
+
 def authenticate_person(data, user_db, face_rec, gait_rec):
+    """
+    Logic ใหม่:
+    - ใช้ face_mean เป็นหลัก
+    - ถ้าไม่มีหน้า: ต้อง gait > 0.80 ถึงจะยอมรับ
+    - ถ้ามีหน้า: total = face*0.7 + gait*0.3 และ threshold > 0.60
+    """
     current_gait_feat = gait_rec.extract_features(data["keypoints"])
 
     best_match = "Unknown"
@@ -34,26 +63,28 @@ def authenticate_person(data, user_db, face_rec, gait_rec):
     best_face_score = 0.0
     best_gait_score = 0.0
 
+    recent_faces = data["faces"][-5:]
+
     for user_id, enrolled_data in user_db.items():
-        enrolled_gait = enrolled_data.get("gait_features", None)
-        enrolled_faces = enrolled_data.get("face_embeddings", [])
+        enrolled_gait = enrolled_data.get("gait_features")
+        enrolled_face_mean = enrolled_data.get("face_mean")
 
         gait_score = gait_rec.compare(current_gait_feat, enrolled_gait)
 
         face_scores = []
-        recent_faces = data["faces"][-5:]
-
         for idx, face_img in enumerate(recent_faces):
+            if face_img is None or face_img.size == 0:
+                continue
+
             temp_path = os.path.join(PROJECT_ROOT, f"temp_face_{user_id}_{idx}.jpg")
             try:
                 cv2.imwrite(temp_path, face_img)
                 test_emb = face_rec.extract_features(temp_path)
 
-                if test_emb and len(test_emb) > 0:
+                if test_emb and len(test_emb) > 0 and enrolled_face_mean is not None:
                     v1 = test_emb[0]["embedding"]
-                    for v2 in enrolled_faces:
-                        sim = cosine_similarity(v1, v2)
-                        face_scores.append(sim)
+                    sim = cosine_similarity(v1, enrolled_face_mean)
+                    face_scores.append(sim)
 
             except Exception:
                 pass
@@ -66,34 +97,36 @@ def authenticate_person(data, user_db, face_rec, gait_rec):
 
         avg_face_score = float(np.mean(face_scores)) if face_scores else None
 
+        # Dynamic fusion
         if avg_face_score is None:
+            # ไม่มีหน้า -> ใช้ gait อย่างเดียว แต่ threshold ต้องสูง
             total_score = gait_score
+            accept = gait_score > 0.80
             used_face_score = 0.0
         else:
-            total_score = (avg_face_score * 0.5) + (gait_score * 0.5)
+            total_score = (avg_face_score * 0.7) + (gait_score * 0.3)
+            accept = total_score > 0.60
             used_face_score = avg_face_score
 
-        if total_score > 0.50 and total_score > best_total_score:
+        if accept and total_score > best_total_score:
             best_total_score = total_score
             best_match = user_id
             best_face_score = used_face_score
             best_gait_score = gait_score
 
-    result = {
+    return {
         "identity": best_match,
         "total_score": float(best_total_score),
         "face_score": float(best_face_score),
         "gait_score": float(best_gait_score),
     }
-    return result
 
 
 def preprocess_frame(frame):
     kernel = np.array([[0, -1, 0],
                        [-1, 5, -1],
                        [0, -1, 0]])
-    frame = cv2.filter2D(frame, -1, kernel)
-    return frame
+    return cv2.filter2D(frame, -1, kernel)
 
 
 def draw_person_info(frame, x1, y1, x2, y2, info, frame_count):
@@ -104,8 +137,8 @@ def draw_person_info(frame, x1, y1, x2, y2, info, frame_count):
 
     if identity == "Unknown":
         color = (0, 0, 255)
-        status = "Scanning/Unknown"
-    elif total_score >= 0.70:
+        status = "Unknown"
+    elif total_score >= 0.75:
         color = (0, 255, 0)
         status = "Verified"
     else:
@@ -203,6 +236,7 @@ def main():
             print(f"Cannot open source: {source}")
             continue
 
+        # track_id -> data
         person_data = {}
 
         while cap.isOpened():
@@ -210,8 +244,16 @@ def main():
             if not ret:
                 break
 
+            frame = cv2.resize(frame, (960, 540))
             frame = preprocess_frame(frame)
             results = tracker.track(frame)
+
+            # วาด pose/skeleton ถ้ามีผลลัพธ์
+            if results and len(results) > 0:
+                try:
+                    frame = results[0].plot()
+                except Exception:
+                    pass
 
             current_time = datetime.now().strftime("%H:%M:%S")
             cv2.putText(
@@ -250,14 +292,14 @@ def main():
                                     "total_score": 0.0,
                                     "face_score": 0.0,
                                     "gait_score": 0.0,
-                                }
+                                },
+                                "history": [],   # smoothing
                             }
 
                         person_data[track_id]["keypoints"].append(keypoints[i])
                         person_data[track_id]["keypoints"] = person_data[track_id]["keypoints"][-90:]
 
                         x1, y1, x2, y2 = map(int, boxes[i])
-
                         x1 = max(0, x1)
                         y1 = max(0, y1)
                         x2 = min(frame.shape[1], x2)
@@ -271,21 +313,33 @@ def main():
                                 top_h = int(h * 0.45)
                                 face_crop = person_crop[0:top_h, :]
 
-                                if face_crop.size > 0:
+                                # กันภาพเล็ก/ขยะ
+                                if face_crop.size > 0 and face_crop.shape[0] >= 40 and face_crop.shape[1] >= 40:
                                     person_data[track_id]["faces"].append(face_crop)
                                     person_data[track_id]["faces"] = person_data[track_id]["faces"][-10:]
 
                         num_kpts = len(person_data[track_id]["keypoints"])
-                        if num_kpts >= 60 and num_kpts % 15 == 0:
+
+                        if num_kpts >= 60 and num_kpts % 45 == 0:
                             result = authenticate_person(
                                 person_data[track_id],
                                 user_db,
                                 face_rec,
                                 gait_rec,
                             )
+
+                            # temporal smoothing
+                            person_data[track_id]["history"].append(result["identity"])
+                            person_data[track_id]["history"] = person_data[track_id]["history"][-5:]
+
+                            smoothed_id = stable_identity(
+                                person_data[track_id]["history"],
+                                default="Scanning..."
+                            )
+                            result["identity"] = smoothed_id
                             person_data[track_id]["result"] = result
 
-                            if result["identity"] != "Unknown":
+                            if result["identity"] != "Unknown" and result["identity"] != "Scanning...":
                                 att_logger.log_attendance(
                                     result["identity"],
                                     confidence=result["total_score"]

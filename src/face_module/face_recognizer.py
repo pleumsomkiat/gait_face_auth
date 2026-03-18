@@ -18,11 +18,11 @@ class FaceRecognizer:
             return img
         return img_path # Already an array
 
-    def extract_features(self, face_image):
+    def extract_features(self, face_image, enforce_detection=False):
         try:
             img = self._read_img(face_image)
             # Pass numpy array instead of path
-            embeddings = DeepFace.represent(img_path=img, model_name=self.model_name, enforce_detection=False)
+            embeddings = DeepFace.represent(img_path=img, model_name=self.model_name, enforce_detection=enforce_detection)
             return embeddings
         except Exception as e:
             print(f"Face extraction error: {e}")
