@@ -12,6 +12,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, "..", ".."))
 DEFAULT_LOG_PATH = os.path.join(PROJECT_ROOT, "logs", "attendance.csv")
 DEFAULT_REMOTE_API_URL = "https://new-data2.onrender.com/checkin"
 DEFAULT_USER_ID_MAP_PATH = os.path.join(PROJECT_ROOT, "config", "user_id_map.json")
+DEFAULT_REMOTE_SOURCE = "gait-face-auth"
 
 
 class AttendanceLogger:
@@ -22,6 +23,8 @@ class AttendanceLogger:
         remote_api_url=None,
         user_id_map_path=DEFAULT_USER_ID_MAP_PATH,
         remote_timeout_seconds=3.0,
+        remote_source=DEFAULT_REMOTE_SOURCE,
+        preview_only=None,
     ):
         self.log_path = log_path
         self.cooldown_seconds = cooldown_seconds
@@ -32,6 +35,13 @@ class AttendanceLogger:
         )
         self.user_id_map_path = user_id_map_path
         self.remote_timeout_seconds = remote_timeout_seconds
+        self.remote_source = remote_source
+        self.preview_only = (
+            preview_only
+            if preview_only is not None
+            else os.getenv("ATTENDANCE_PREVIEW_ONLY", "").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
         self.last_logged = {}  # subject key -> last timestamp
         self.user_id_map = self._load_user_id_map()
 
@@ -69,11 +79,19 @@ class AttendanceLogger:
 
         return str(display_name or user_id)
 
-    def post_remote_checkin(self, remote_user_id):
+    def post_remote_checkin(self, remote_user_id, display_name=None, confidence=0.0):
         if not self.remote_api_url:
             return False, "remote disabled"
 
-        payload = json.dumps({"user_id": remote_user_id}).encode("utf-8")
+        payload = json.dumps(
+            {
+                "user_id": remote_user_id,
+                "display_name": str(display_name or remote_user_id),
+                "confidence_score": round(float(confidence), 4),
+                "source": self.remote_source,
+                "preview_only": self.preview_only,
+            }
+        ).encode("utf-8")
         req = request.Request(
             self.remote_api_url,
             data=payload,
@@ -96,16 +114,20 @@ class AttendanceLogger:
         except Exception as exc:
             return False, str(exc)
 
-    def sync_remote_checkin_async(self, remote_user_id):
+    def sync_remote_checkin_async(self, remote_user_id, display_name=None, confidence=0.0):
         worker = threading.Thread(
             target=self._sync_remote_checkin_worker,
-            args=(remote_user_id,),
+            args=(remote_user_id, display_name, confidence),
             daemon=True,
         )
         worker.start()
 
-    def _sync_remote_checkin_worker(self, remote_user_id):
-        remote_ok, remote_message = self.post_remote_checkin(remote_user_id)
+    def _sync_remote_checkin_worker(self, remote_user_id, display_name, confidence):
+        remote_ok, remote_message = self.post_remote_checkin(
+            remote_user_id,
+            display_name=display_name,
+            confidence=confidence,
+        )
         if remote_ok:
             print(f"Remote check-in synced: {remote_user_id} ({remote_message})")
         else:
@@ -126,7 +148,11 @@ class AttendanceLogger:
             writer.writerow([timestamp, user_id, f"{confidence:.4f}"])
 
         remote_user_id = self.resolve_remote_user_id(user_id, display_name=display_name)
-        self.sync_remote_checkin_async(remote_user_id)
+        self.sync_remote_checkin_async(
+            remote_user_id,
+            display_name=display_name,
+            confidence=confidence,
+        )
 
         self.last_logged[user_id] = now_ts
         return True
