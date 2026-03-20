@@ -157,6 +157,53 @@ def make_person_state():
         "history": [],
         "frame_counter": 0,
         "last_auth_frame": 0,
+        "pending_identity": None,
+        "pending_count": 0,
+        "confirmed_identity": None,
+        "session_logged": False,
+    }
+
+
+def resolve_live_session_result(state, result):
+    identity = result.get("identity", "Scanning...")
+
+    if identity in {"Unknown", "Scanning..."}:
+        state["pending_identity"] = None
+        state["pending_count"] = 0
+        if state.get("confirmed_identity"):
+            return dict(state["result"])
+        return {
+            "identity": "Scanning...",
+            "display_name": "Scanning...",
+            "total_score": 0.0,
+            "face_score": 0.0,
+            "gait_score": 0.0,
+            "status_hint": "Collecting face and gait",
+        }
+
+    confirmed_identity = state.get("confirmed_identity")
+    if confirmed_identity:
+        if identity == confirmed_identity:
+            return dict(result)
+        return dict(state["result"])
+
+    if state.get("pending_identity") == identity:
+        state["pending_count"] += 1
+    else:
+        state["pending_identity"] = identity
+        state["pending_count"] = 1
+
+    if state["pending_count"] >= 2:
+        state["confirmed_identity"] = identity
+        return dict(result)
+
+    return {
+        "identity": "Scanning...",
+        "display_name": "Scanning...",
+        "total_score": 0.0,
+        "face_score": 0.0,
+        "gait_score": 0.0,
+        "status_hint": "Confirming identity",
     }
 
 
@@ -174,23 +221,46 @@ def face_quality_score(face_img):
     return float(sharpness * np.sqrt(max(1, h * w)))
 
 
+def pose_frame_is_reliable(keypoints):
+    if keypoints is None or len(keypoints) < 17:
+        return False
+
+    try:
+        conf = np.asarray(keypoints[:, 2], dtype=np.float32)
+    except Exception:
+        return False
+
+    core_idx = [5, 6, 11, 12, 13, 14, 15, 16]
+    arm_idx = [7, 8, 9, 10]
+    lower_idx = [11, 12, 13, 14, 15, 16]
+
+    core_mean = float(np.mean(conf[core_idx]))
+    arm_mean = float(np.mean(conf[arm_idx]))
+    lower_min = float(np.min(conf[lower_idx]))
+
+    return core_mean >= 0.32 and arm_mean >= 0.15 and lower_min >= 0.10
+
+
 def extract_best_face_crop(person_crop, face_detector):
     if person_crop is None or person_crop.size == 0:
         return None
 
     h, _ = person_crop.shape[:2]
-    top_h = min(h, max(40, int(h * 0.60)))
+    top_h = min(h, max(50, int(h * 0.75)))
     upper_body = person_crop[:top_h, :]
 
     detected_face = face_detector.extract_primary_face(upper_body)
-    if detected_face is not None:
-        return detected_face
-
-    fallback = upper_body[: max(40, int(upper_body.shape[0] * 0.75)), :]
-    if fallback.size == 0:
+    if detected_face is None or detected_face.size == 0:
         return None
 
-    return fallback
+    face_h, face_w = detected_face.shape[:2]
+    aspect_ratio = face_w / max(1.0, float(face_h))
+    if face_h < 48 or face_w < 48:
+        return None
+    if aspect_ratio < 0.55 or aspect_ratio > 1.8:
+        return None
+
+    return detected_face
 
 
 def pick_primary_live_index(boxes, frame_shape):
@@ -222,7 +292,7 @@ def pick_primary_live_index(boxes, frame_shape):
 
 
 def extract_recent_face_embeddings(face_images, face_rec, max_faces=3):
-    embeddings = []
+    embedding_candidates = []
     scored_faces = []
 
     for face_img in face_images:
@@ -232,20 +302,51 @@ def extract_recent_face_embeddings(face_images, face_rec, max_faces=3):
 
     scored_faces.sort(key=lambda item: item[0], reverse=True)
 
-    for quality, face_img in scored_faces[:max_faces]:
+    for quality, face_img in scored_faces[: max(6, max_faces * 2)]:
         if quality <= 0:
             continue
 
         try:
-            face_result = face_rec.extract_features(face_img)
+            # The crop has already passed an explicit face detector, so allowing
+            # represent() to skip a second hard rejection keeps live scan usable
+            # while the earlier crop filters still block obvious non-face inputs.
+            face_result = face_rec.extract_features(face_img, enforce_detection=False)
             if face_result and len(face_result) > 0:
-                embeddings.append(
-                    np.asarray(face_result[0]["embedding"], dtype=np.float32)
+                embedding_candidates.append(
+                    (
+                        float(quality),
+                        np.asarray(face_result[0]["embedding"], dtype=np.float32),
+                    )
                 )
         except Exception:
             pass
 
-    return embeddings
+    if not embedding_candidates:
+        return []
+
+    if len(embedding_candidates) == 1:
+        return [embedding_candidates[0][1]]
+
+    ranked_candidates = []
+    for idx, (quality, embedding) in enumerate(embedding_candidates):
+        peer_scores = [
+            cosine_similarity(embedding, other_embedding)
+            for other_idx, (_, other_embedding) in enumerate(embedding_candidates)
+            if other_idx != idx
+        ]
+        consensus = float(np.mean(peer_scores)) if peer_scores else 1.0
+        ranked_candidates.append((consensus, quality, embedding))
+
+    ranked_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+
+    consistent_embeddings = []
+    for consensus, _, embedding in ranked_candidates:
+        if consensus >= 0.45 or len(consistent_embeddings) < 2:
+            consistent_embeddings.append(embedding)
+        if len(consistent_embeddings) >= max_faces:
+            break
+
+    return consistent_embeddings
 
 
 def authenticate_person(data, user_db, face_rec, gait_rec, live_mode=False):
@@ -258,6 +359,8 @@ def authenticate_person(data, user_db, face_rec, gait_rec, live_mode=False):
     best_total_score = 0.0
     best_face_score = 0.0
     best_gait_score = 0.0
+    ambiguous_live_match = False
+    live_candidates = []
 
     for user_id, enrolled_data in user_db.items():
         enrolled_gait = enrolled_data.get("gait_features")
@@ -274,20 +377,24 @@ def authenticate_person(data, user_db, face_rec, gait_rec, live_mode=False):
         avg_face_score = float(np.mean(face_scores)) if face_scores else None
 
         if live_mode:
+            accept = False
             if avg_face_score is None or current_gait_feat is None:
                 total_score = 0.0
-                accept = False
                 used_face_score = float(avg_face_score or 0.0)
             else:
                 face_weight = 0.65
                 gait_weight = 0.35
                 total_score = (avg_face_score * face_weight) + (gait_score * gait_weight)
-                accept = (
-                    total_score > 0.67
-                    and avg_face_score > 0.60
-                    and gait_score > 0.55
-                )
                 used_face_score = avg_face_score
+                live_candidates.append(
+                    {
+                        "identity": user_id,
+                        "display_name": enrolled_data.get("display_name", user_id),
+                        "total_score": float(total_score),
+                        "face_score": float(avg_face_score),
+                        "gait_score": float(gait_score),
+                    }
+                )
         else:
             if avg_face_score is None:
                 total_score = gait_score
@@ -304,6 +411,52 @@ def authenticate_person(data, user_db, face_rec, gait_rec, live_mode=False):
             best_face_score = used_face_score
             best_gait_score = gait_score
 
+    if live_mode and live_candidates:
+        ranked_candidates = sorted(
+            live_candidates,
+            key=lambda item: item["total_score"],
+            reverse=True,
+        )
+        best_candidate = ranked_candidates[0]
+        second_candidate = ranked_candidates[1] if len(ranked_candidates) > 1 else None
+
+        total_margin = (
+            best_candidate["total_score"] - second_candidate["total_score"]
+            if second_candidate
+            else best_candidate["total_score"]
+        )
+        face_margin = (
+            best_candidate["face_score"] - second_candidate["face_score"]
+            if second_candidate
+            else best_candidate["face_score"]
+        )
+        gait_margin = (
+            best_candidate["gait_score"] - second_candidate["gait_score"]
+            if second_candidate
+            else best_candidate["gait_score"]
+        )
+
+        margin_is_clear = second_candidate is None or (
+            total_margin >= 0.05
+            and (face_margin >= 0.03 or gait_margin >= 0.03)
+        )
+        accept_live_candidate = (
+            best_candidate["total_score"] > 0.69
+            and best_candidate["face_score"] > 0.62
+            and best_candidate["gait_score"] > 0.56
+            and margin_is_clear
+        )
+
+        if accept_live_candidate:
+            best_match = best_candidate["identity"]
+            best_total_score = best_candidate["total_score"]
+            best_face_score = best_candidate["face_score"]
+            best_gait_score = best_candidate["gait_score"]
+        elif best_candidate["total_score"] > 0.64:
+            ambiguous_live_match = True
+            best_face_score = best_candidate["face_score"]
+            best_gait_score = best_candidate["gait_score"]
+
     if live_mode:
         if not has_face_signal and not has_gait_signal:
             status_hint = "Collecting face and gait"
@@ -311,6 +464,8 @@ def authenticate_person(data, user_db, face_rec, gait_rec, live_mode=False):
             status_hint = "Need face"
         elif not has_gait_signal:
             status_hint = "Need gait"
+        elif ambiguous_live_match:
+            status_hint = "Ambiguous match"
         elif best_match == "Unknown":
             status_hint = "No multimodal match"
         else:
@@ -543,8 +698,9 @@ def main():
 
                 state = person_data[subject_key]
                 state["frame_counter"] += 1
-                state["keypoints"].append(keypoints[idx])
-                state["keypoints"] = state["keypoints"][-90:]
+                if pose_frame_is_reliable(keypoints[idx]):
+                    state["keypoints"].append(keypoints[idx])
+                    state["keypoints"] = state["keypoints"][-90:]
 
                 x1, y1, x2, y2 = map(int, boxes[idx][:4])
                 x1 = max(0, x1)
@@ -609,13 +765,30 @@ def main():
                         smoothed_id,
                         {},
                     ).get("display_name", smoothed_result.get("display_name", smoothed_id))
-                    state["result"] = smoothed_result
+                    final_result = (
+                        resolve_live_session_result(state, smoothed_result)
+                        if args.live
+                        else smoothed_result
+                    )
+                    state["result"] = final_result
 
-                    if smoothed_result["identity"] not in {"Unknown", "Scanning..."}:
+                    if args.live:
+                        if (
+                            state.get("confirmed_identity")
+                            and not state.get("session_logged")
+                            and final_result["identity"] not in {"Unknown", "Scanning..."}
+                        ):
+                            att_logger.log_attendance(
+                                final_result["identity"],
+                                confidence=final_result["total_score"],
+                                display_name=final_result.get("display_name"),
+                            )
+                            state["session_logged"] = True
+                    elif final_result["identity"] not in {"Unknown", "Scanning..."}:
                         att_logger.log_attendance(
-                            smoothed_result["identity"],
-                            confidence=smoothed_result["total_score"],
-                            display_name=smoothed_result.get("display_name"),
+                            final_result["identity"],
+                            confidence=final_result["total_score"],
+                            display_name=final_result.get("display_name"),
                         )
 
                 display_frame = draw_person_info(
