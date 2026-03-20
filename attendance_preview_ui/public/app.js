@@ -47,6 +47,42 @@ function badgeClass(storage) {
   return "preview";
 }
 
+function makePreviewFallbackItems(reportItems) {
+  return reportItems.slice(0, 8).map((item) => ({
+    user_id: item.user_id,
+    display_name: item.display_name || item.full_name || item.user_id,
+    confidence_score: item.confidence_score,
+    source: item.source || "report-fallback",
+    preview_only: false,
+    status: item.status || "Stored",
+    storage: "stored",
+    message: "โหลดจาก /report fallback",
+    attend_date: item.attend_date,
+    time: item.time,
+  }));
+}
+
+async function fetchJsonWithFallback(urls) {
+  let lastError = null;
+
+  for (const url of urls) {
+    try {
+      const response = await fetch(url);
+      if (!response.ok) {
+        throw new Error(`Request failed: ${url} (${response.status})`);
+      }
+      return {
+        data: await response.json(),
+        url,
+      };
+    } catch (err) {
+      lastError = err;
+    }
+  }
+
+  throw lastError || new Error("โหลดข้อมูลจาก API ไม่สำเร็จ");
+}
+
 function renderPreview(previewItems) {
   previewCount.textContent = String(previewItems.length);
   previewOnlyCount.textContent = String(
@@ -115,21 +151,31 @@ function renderReport(reportItems) {
 
 async function loadDashboard() {
   try {
-    const [previewResp, reportResp] = await Promise.all([
-      fetch("/api/preview"),
-      fetch("/api/report"),
-    ]);
-
-    if (!previewResp.ok || !reportResp.ok) {
-      throw new Error("โหลดข้อมูลจาก API ไม่สำเร็จ");
+    let previewItems = [];
+    let previewSource = "/api/preview";
+    try {
+      const previewResult = await fetchJsonWithFallback(["/api/preview"]);
+      previewItems = Array.isArray(previewResult.data) ? previewResult.data : [];
+      previewSource = previewResult.url;
+    } catch (err) {
+      previewItems = [];
+      previewSource = "none";
     }
 
-    const previewItems = await previewResp.json();
-    const reportItems = await reportResp.json();
+    const reportResult = await fetchJsonWithFallback(["/api/report", "/report"]);
+    const reportItems = Array.isArray(reportResult.data) ? reportResult.data : [];
+
+    if (!previewItems.length && reportItems.length) {
+      previewItems = makePreviewFallbackItems(reportItems);
+      previewSource = `${reportResult.url} fallback`;
+    }
 
     renderPreview(previewItems);
     renderReport(reportItems);
-    systemStatus.textContent = "พร้อมใช้งาน";
+    systemStatus.textContent =
+      reportResult.url === "/report" || previewSource !== "/api/preview"
+        ? "พร้อมใช้งาน (fallback mode)"
+        : "พร้อมใช้งาน";
     lastRefresh.textContent = new Date().toLocaleTimeString("th-TH");
   } catch (err) {
     systemStatus.textContent = "เชื่อมต่อไม่สำเร็จ";
