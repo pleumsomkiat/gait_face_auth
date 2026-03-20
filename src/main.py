@@ -615,6 +615,7 @@ def main():
                         att_logger.log_attendance(
                             smoothed_result["identity"],
                             confidence=smoothed_result["total_score"],
+                            display_name=smoothed_result.get("display_name"),
                         )
 
                 display_frame = draw_person_info(
