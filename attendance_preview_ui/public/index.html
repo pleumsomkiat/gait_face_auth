@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Attendance Preview Dashboard</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <main class="page-shell">
+    <section class="hero">
+      <div>
+        <p class="eyebrow">Preview Before Storage</p>
+        <h1>Attendance Preview Dashboard</h1>
+        <p class="hero-copy">
+          หน้าเว็บจำลองสำหรับดูข้อมูลที่ยิงเข้ามาจาก API ก่อนหรือระหว่างบันทึกลงฐานข้อมูลจริง
+        </p>
+      </div>
+      <div class="hero-meta">
+        <div class="meta-card">
+          <span>สถานะระบบ</span>
+          <strong id="systemStatus">กำลังเชื่อมต่อ...</strong>
+        </div>
+        <div class="meta-card">
+          <span>อัปเดตล่าสุด</span>
+          <strong id="lastRefresh">-</strong>
+        </div>
+      </div>
+    </section>
+
+    <section class="summary-grid">
+      <article class="summary-card">
+        <span>Preview Queue</span>
+        <strong id="previewCount">0</strong>
+      </article>
+      <article class="summary-card">
+        <span>Stored Today</span>
+        <strong id="storedCount">0</strong>
+      </article>
+      <article class="summary-card">
+        <span>Preview Only</span>
+        <strong id="previewOnlyCount">0</strong>
+      </article>
+    </section>
+
+    <section class="panel-grid">
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="panel-kicker">Live Preview</p>
+            <h2>ข้อมูลล่าสุดจาก API</h2>
+          </div>
+          <button id="refreshButton" class="ghost-button" type="button">รีเฟรช</button>
+        </div>
+        <div id="previewFeed" class="feed-list"></div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <div>
+            <p class="panel-kicker">Mock Sender</p>
+            <h2>ลองยิงข้อมูลแบบจำลอง</h2>
+          </div>
+        </div>
+        <form id="checkinForm" class="mock-form">
+          <label>
+            <span>User ID</span>
+            <input id="userIdInput" name="user_id" placeholder="65010001 หรือ ปลื้ม" required>
+          </label>
+          <label>
+            <span>Display Name</span>
+            <input id="displayNameInput" name="display_name" placeholder="ชื่อที่อยากให้โชว์">
+          </label>
+          <label>
+            <span>Confidence</span>
+            <input id="confidenceInput" name="confidence_score" type="number" min="0" max="1" step="0.01" value="0.88">
+          </label>
+          <label>
+            <span>Source</span>
+            <input id="sourceInput" name="source" value="dashboard-mock">
+          </label>
+          <label class="checkbox-row">
+            <input id="previewOnlyInput" name="preview_only" type="checkbox" checked>
+            <span>Preview only ไม่บันทึกลงฐานข้อมูล</span>
+          </label>
+          <button class="primary-button" type="submit">ส่งเข้า API</button>
+          <pre id="submitResult" class="submit-result">พร้อมทดสอบ</pre>
+        </form>
+      </section>
+    </section>
+
+    <section class="panel wide-panel">
+      <div class="panel-head">
+        <div>
+          <p class="panel-kicker">Stored Records</p>
+          <h2>ข้อมูลที่เก็บแล้ว</h2>
+        </div>
+      </div>
+      <div class="table-shell">
+        <table>
+          <thead>
+            <tr>
+              <th>Name</th>
+              <th>User ID</th>
+              <th>Date</th>
+              <th>Time</th>
+              <th>Status</th>
+              <th>Source</th>
+              <th>Confidence</th>
+            </tr>
+          </thead>
+          <tbody id="reportTableBody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
